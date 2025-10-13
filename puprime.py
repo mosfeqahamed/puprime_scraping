@@ -4,6 +4,8 @@ import hashlib
 import random
 import os
 import schedule
+import signal
+import atexit
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 from selenium import webdriver
@@ -31,6 +33,29 @@ try:
 except (ImportError, ModuleNotFoundError):
     UC_AVAILABLE = False
     print("Note: undetected-chromedriver not available, using enhanced regular Selenium")
+
+# Global cleanup registry for drivers
+_active_drivers = set()
+
+def _cleanup_all_drivers():
+    """Cleanup all active drivers on program exit"""
+    for driver_ref in list(_active_drivers):
+        try:
+            if hasattr(driver_ref, '_cleanup_driver'):
+                driver_ref._cleanup_driver()
+        except:
+            pass
+    _active_drivers.clear()
+
+def _signal_handler(signum, frame):
+    """Handle signals to ensure proper cleanup"""
+    _cleanup_all_drivers()
+    exit(0)
+
+# Register cleanup handlers
+atexit.register(_cleanup_all_drivers)
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 
 class MongoDBManager:
@@ -203,6 +228,15 @@ class PUPrimeSeleniumScraper:
         self.use_uc = use_uc if use_uc is not None else UC_AVAILABLE
         self.driver = None
         self.wait = None
+        self.driver_initialized = False
+    
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensures cleanup"""
+        self._cleanup_driver()
         
     def _setup_driver(self):
         """Setup Chrome driver with anti-detection measures"""
@@ -238,6 +272,10 @@ class PUPrimeSeleniumScraper:
         # Create driver with undetected-chromedriver
         self.driver = uc.Chrome(options=options, version_main=None)
         self.wait = WebDriverWait(self.driver, 20)
+        self.driver_initialized = True
+        
+        # Register for global cleanup
+        _active_drivers.add(self)
         
         self.logger.log('INFO', 'Undetected Chrome driver initialized successfully')
     
@@ -297,6 +335,10 @@ class PUPrimeSeleniumScraper:
         
         # Execute anti-detection scripts
         self._apply_stealth_scripts()
+        self.driver_initialized = True
+        
+        # Register for global cleanup
+        _active_drivers.add(self)
         
         self.logger.log('INFO', 'Enhanced regular Chrome driver initialized')
     
@@ -396,6 +438,58 @@ class PUPrimeSeleniumScraper:
                 
         except Exception as e:
             self.logger.log('DEBUG', f'Error dismissing overlays: {str(e)}')
+    
+    def _is_driver_valid(self):
+        """Check if the driver is still valid and usable"""
+        try:
+            if not self.driver or not self.driver_initialized:
+                return False
+            # Try to get current URL to test if driver is responsive
+            self.driver.current_url
+            return True
+        except Exception:
+            return False
+    
+    def _cleanup_driver(self):
+        """Safely cleanup the driver"""
+        if not self.driver_initialized:
+            return
+            
+        # Unregister from global cleanup
+        _active_drivers.discard(self)
+            
+        try:
+            if self.driver and self._is_driver_valid():
+                # For undetected-chromedriver, we need to be more careful
+                if self.use_uc and UC_AVAILABLE:
+                    # Try to close all windows first
+                    try:
+                        for handle in self.driver.window_handles:
+                            self.driver.switch_to.window(handle)
+                            self.driver.close()
+                    except:
+                        pass
+                
+                # Now quit the driver
+                self.driver.quit()
+                self.logger.log('INFO', 'Browser closed successfully')
+        except Exception as e:
+            self.logger.log('WARNING', f'Error closing browser: {str(e)}')
+        finally:
+            # Clear references to prevent __del__ from being called
+            if self.driver:
+                try:
+                    # For undetected-chromedriver, set service to None to prevent cleanup issues
+                    if hasattr(self.driver, 'service') and self.driver.service:
+                        self.driver.service = None
+                    # Also try to clear the process reference
+                    if hasattr(self.driver, 'service') and hasattr(self.driver.service, 'process'):
+                        self.driver.service.process = None
+                except:
+                    pass
+            self.driver = None
+            self.wait = None
+            self.driver_initialized = False
     
     def _wait_for_element(self, by, value, timeout=10):
         """Wait for element to be present and return it"""
@@ -869,12 +963,7 @@ class PUPrimeSeleniumScraper:
                 self.driver.save_screenshot('final_error.png')
             raise
         finally:
-            if self.driver:
-                try:
-                    self.driver.quit()
-                    self.logger.log('INFO', 'Browser closed')
-                except Exception as e:
-                    self.logger.log('WARNING', f'Error closing browser: {str(e)}')
+            self._cleanup_driver()
     
     def _fetch_via_ui_search(self, mt4accounts: List[str]) -> List[Dict]:
         """Try to search for accounts through the UI"""
@@ -1282,11 +1371,8 @@ class PUPrimeAccountScraper:
             }
         finally:
             # Cleanup
-            if hasattr(self.scraper, 'driver') and self.scraper.driver:
-                try:
-                    self.scraper.driver.quit()
-                except Exception as e:
-                    self.logger.log('WARNING', f'Error closing browser: {str(e)}')
+            if hasattr(self.scraper, '_cleanup_driver'):
+                self.scraper._cleanup_driver()
             if hasattr(self, 'mongodb') and self.mongodb:
                 self.mongodb.disconnect()
     
@@ -1366,11 +1452,8 @@ class PUPrimeAccountScraper:
             }
         finally:
             # Cleanup
-            if hasattr(self.scraper, 'driver') and self.scraper.driver:
-                try:
-                    self.scraper.driver.quit()
-                except Exception as e:
-                    self.logger.log('WARNING', f'Error closing browser: {str(e)}')
+            if hasattr(self.scraper, '_cleanup_driver'):
+                self.scraper._cleanup_driver()
             if hasattr(self, 'mongodb') and self.mongodb:
                 self.mongodb.disconnect()
 
@@ -1527,30 +1610,32 @@ if __name__ == '__main__':
     
     # For backward compatibility, also support the old usage
     if len(sys.argv) == 1:
-        # Old usage - run with hardcoded credentials for testing
+        # Default behavior - run with hardcoded credentials in scheduled mode (every hour)
         logger = SimpleLogger()
         
-        logger.log('INFO', 'Running in legacy mode with hardcoded credentials')
-        logger.log('INFO', 'For production use, please use command line arguments:')
-        logger.log('INFO', 'python puprime.py --email your@email.com --password yourpassword --mode full')
-        
-        scraper = PUPrimeAccountScraper(
-            logger=logger,
-            email='zebb@kumrif.com',
-            password='!Vinnaren1989!',
-            headless=False
-        )
+        logger.log('INFO', '🚀 Starting PU Prime Scraper in scheduled mode')
+        logger.log('INFO', '📅 Will scrape every 1 hour automatically')
+        logger.log('INFO', '⏹️  Press Ctrl+C to stop the scheduler')
+        logger.log('INFO', '')
+        logger.log('INFO', 'Using hardcoded credentials for automatic operation')
+        logger.log('INFO', 'For custom settings, use command line arguments:')
+        logger.log('INFO', 'python puprime.py --email your@email.com --password yourpassword --mode scheduled --interval 1')
+        logger.log('INFO', '')
         
         try:
-            result = scraper.run_full_sync()
+            # Start scheduled sync service with 1-hour interval
+            sync_manager = ScheduledSyncManager(
+                logger=logger,
+                email='',
+                password='',
+                mongodb_uri=None,  # Use default MongoDB connection
+                sync_interval_hours=1,  # Every 1 hour
+                headless=True  # Run in headless mode for background operation
+            )
+            sync_manager.start_scheduled_sync()
             
-            if result['status'] == 'success':
-                logger.log('INFO', f"✅ Successfully scraped {result['records_scraped']} records")
-                logger.log('INFO', f"Records processed: {result['records_processed']}")
-                logger.log('INFO', f"Total in database: {result['total_in_db']}")
-            else:
-                logger.log('ERROR', f"❌ Error: {result['error']}")
-                
+        except KeyboardInterrupt:
+            logger.log('INFO', '🛑 Scheduler stopped by user')
         except Exception as e:
             logger.log('ERROR', f"❌ Error: {str(e)}")
             sys.exit(1)
