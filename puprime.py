@@ -2,7 +2,9 @@ import time
 import json
 import hashlib
 import random
-from datetime import datetime
+import os
+import schedule
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -12,7 +14,15 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys
 import requests
+from pymongo import MongoClient
+from pymongo.collection import Collection
+from pymongo.database import Database
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Try to import undetected-chromedriver, but don't fail if not available
 try:
@@ -21,6 +31,161 @@ try:
 except (ImportError, ModuleNotFoundError):
     UC_AVAILABLE = False
     print("Note: undetected-chromedriver not available, using enhanced regular Selenium")
+
+
+class MongoDBManager:
+    """MongoDB connection and data management"""
+    
+    def __init__(self, logger, connection_string: str = None, database_name: str = "puprime_data"):
+        self.logger = logger
+        self.connection_string = connection_string or os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+        self.database_name = database_name
+        self.client: MongoClient = None
+        self.db: Database = None
+        self.accounts_collection: Collection = None
+        self.sync_log_collection: Collection = None
+        
+        # Validate connection string format
+        self._validate_connection_string()
+    
+    def _validate_connection_string(self):
+        """Validate MongoDB connection string format"""
+        if not self.connection_string:
+            raise ValueError("MongoDB connection string is required")
+        
+        # Check for MongoDB Atlas format
+        if self.connection_string.startswith('mongodb+srv://'):
+            self.logger.log('INFO', 'Using MongoDB Atlas connection')
+        elif self.connection_string.startswith('mongodb://'):
+            self.logger.log('INFO', 'Using MongoDB connection')
+        else:
+            self.logger.log('WARNING', 'Unrecognized MongoDB connection string format')
+        
+        # Basic validation
+        if '@' not in self.connection_string and 'mongodb+srv://' in self.connection_string:
+            self.logger.log('WARNING', 'MongoDB Atlas connection string should include username:password@')
+        
+        self.logger.log('DEBUG', f'Connection string: {self.connection_string[:50]}...')
+        
+    def connect(self):
+        """Connect to MongoDB"""
+        try:
+            # Enhanced connection options for MongoDB Atlas
+            connection_options = {
+                'serverSelectionTimeoutMS': 10000,  # 10 second timeout
+                'connectTimeoutMS': 10000,          # 10 second connection timeout
+                'socketTimeoutMS': 20000,           # 20 second socket timeout
+                'retryWrites': True,                # Enable retryable writes
+                'w': 'majority'                     # Write concern
+            }
+            
+            self.client = MongoClient(self.connection_string, **connection_options)
+            
+            # Test the connection
+            self.client.admin.command('ping')
+            
+            self.db = self.client[self.database_name]
+            self.accounts_collection = self.db['accounts']
+            self.sync_log_collection = self.db['sync_logs']
+            
+            # Create indexes for better performance (with error handling)
+            try:
+                self.accounts_collection.create_index([("account_number", 1)], unique=True)
+                self.accounts_collection.create_index([("user_id", 1)])
+                self.accounts_collection.create_index([("date", 1)])
+                self.accounts_collection.create_index([("scraped_at", 1)])
+                self.logger.log('INFO', 'Database indexes created/verified')
+            except Exception as index_error:
+                self.logger.log('WARNING', f'Index creation warning: {str(index_error)}')
+            
+            self.logger.log('INFO', f'Connected to MongoDB: {self.database_name}')
+            return True
+        except Exception as e:
+            self.logger.log('ERROR', f'Failed to connect to MongoDB: {str(e)}')
+            if 'authentication failed' in str(e).lower():
+                self.logger.log('ERROR', 'Authentication failed - check username/password')
+            elif 'network' in str(e).lower() or 'timeout' in str(e).lower():
+                self.logger.log('ERROR', 'Network error - check connection string and IP whitelist')
+            return False
+    
+    def disconnect(self):
+        """Disconnect from MongoDB"""
+        if self.client:
+            self.client.close()
+            self.logger.log('INFO', 'Disconnected from MongoDB')
+    
+    def insert_accounts(self, accounts: List[Dict]) -> int:
+        """Insert or update accounts in MongoDB"""
+        if not accounts:
+            return 0
+        
+        inserted_count = 0
+        updated_count = 0
+        
+        for account in accounts:
+            try:
+                # Add metadata
+                account['scraped_at'] = datetime.now(timezone.utc)
+                account['last_updated'] = datetime.now(timezone.utc)
+                
+                # Check if account already exists
+                existing = self.accounts_collection.find_one({"account_number": account['account_number']})
+                
+                if existing:
+                    # Update existing record
+                    update_data = {k: v for k, v in account.items() if k != '_id'}
+                    update_data['last_updated'] = datetime.now(timezone.utc)
+                    
+                    result = self.accounts_collection.update_one(
+                        {"account_number": account['account_number']},
+                        {"$set": update_data}
+                    )
+                    if result.modified_count > 0:
+                        updated_count += 1
+                else:
+                    # Insert new record
+                    result = self.accounts_collection.insert_one(account)
+                    if result.inserted_id:
+                        inserted_count += 1
+                        
+            except Exception as e:
+                self.logger.log('ERROR', f'Error inserting account {account.get("account_number", "unknown")}: {str(e)}')
+        
+        self.logger.log('INFO', f'Database operation completed: {inserted_count} inserted, {updated_count} updated')
+        return inserted_count + updated_count
+    
+    def get_latest_sync_time(self) -> Optional[datetime]:
+        """Get the timestamp of the last successful sync"""
+        try:
+            latest_log = self.sync_log_collection.find_one(
+                {"status": "success"},
+                sort=[("sync_time", -1)]
+            )
+            return latest_log.get('sync_time') if latest_log else None
+        except Exception as e:
+            self.logger.log('ERROR', f'Error getting latest sync time: {str(e)}')
+            return None
+    
+    def log_sync(self, status: str, records_processed: int, error_message: str = None):
+        """Log sync operation"""
+        try:
+            log_entry = {
+                'sync_time': datetime.now(timezone.utc),
+                'status': status,
+                'records_processed': records_processed,
+                'error_message': error_message
+            }
+            self.sync_log_collection.insert_one(log_entry)
+        except Exception as e:
+            self.logger.log('ERROR', f'Error logging sync: {str(e)}')
+    
+    def get_account_count(self) -> int:
+        """Get total number of accounts in database"""
+        try:
+            return self.accounts_collection.count_documents({})
+        except Exception as e:
+            self.logger.log('ERROR', f'Error getting account count: {str(e)}')
+            return 0
 
 
 class PUPrimeSeleniumScraper:
@@ -199,6 +364,39 @@ class PUPrimeSeleniumScraper:
         except:
             pass
     
+    def _dismiss_overlays(self):
+        """Dismiss any page overlays that might block clicks"""
+        try:
+            # Common overlay selectors
+            overlay_selectors = [
+                "//div[@id='driver-page-overlay']",
+                "//div[contains(@class, 'overlay')]",
+                "//div[contains(@class, 'modal')]",
+                "//div[contains(@class, 'popup')]",
+                "//div[contains(@class, 'backdrop')]",
+                "//*[contains(@class, 'driver-overlay')]"
+            ]
+            
+            for selector in overlay_selectors:
+                try:
+                    overlays = self.driver.find_elements(By.XPATH, selector)
+                    for overlay in overlays:
+                        if overlay.is_displayed():
+                            # Try to click outside the overlay or press Escape
+                            self.driver.execute_script("arguments[0].style.display = 'none';", overlay)
+                            self.logger.log('DEBUG', f'Dismissed overlay: {selector}')
+                except:
+                    continue
+                    
+            # Also try pressing Escape key
+            try:
+                self.driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+            except:
+                pass
+                
+        except Exception as e:
+            self.logger.log('DEBUG', f'Error dismissing overlays: {str(e)}')
+    
     def _wait_for_element(self, by, value, timeout=10):
         """Wait for element to be present and return it"""
         try:
@@ -213,12 +411,28 @@ class PUPrimeSeleniumScraper:
     def _wait_and_click(self, by, value, timeout=10):
         """Wait for element to be clickable and click it"""
         try:
+            # First, try to dismiss any overlays
+            self._dismiss_overlays()
+            
             element = WebDriverWait(self.driver, timeout).until(
                 EC.element_to_be_clickable((by, value))
             )
             self._move_to_element(element)
-            element.click()
-            return True
+            
+            # Try multiple click methods
+            try:
+                element.click()
+                return True
+            except Exception as click_error:
+                # If regular click fails, try JavaScript click
+                self.logger.log('DEBUG', f'Regular click failed, trying JavaScript click: {str(click_error)}')
+                try:
+                    self.driver.execute_script("arguments[0].click();", element)
+                    return True
+                except Exception as js_error:
+                    self.logger.log('WARNING', f'JavaScript click also failed: {str(js_error)}')
+                    return False
+                    
         except Exception as e:
             self.logger.log('WARNING', f'Could not click element: {value} - {str(e)}')
             return False
@@ -656,8 +870,11 @@ class PUPrimeSeleniumScraper:
             raise
         finally:
             if self.driver:
-                self.driver.quit()
-                self.logger.log('INFO', 'Browser closed')
+                try:
+                    self.driver.quit()
+                    self.logger.log('INFO', 'Browser closed')
+                except Exception as e:
+                    self.logger.log('WARNING', f'Error closing browser: {str(e)}')
     
     def _fetch_via_ui_search(self, mt4accounts: List[str]) -> List[Dict]:
         """Try to search for accounts through the UI"""
@@ -753,11 +970,483 @@ class PUPrimeSeleniumScraper:
         """Extract account info from current page"""
         # Similar to _extract_visible_accounts but for single account
         pass
+    
+    def navigate_to_account_report(self):
+        """Navigate to the Account Report page after login"""
+        try:
+            self.logger.log('INFO', 'Navigating to Account Report page')
+            
+            # Wait for the page to load completely
+            self._random_delay(3, 5)
+            
+            # Look for Account Report link in the sidebar
+            account_report_selectors = [
+                (By.XPATH, "//a[contains(text(), 'Account Report')]"),
+                (By.XPATH, "//div[contains(text(), 'Account Report')]"),
+                (By.XPATH, "//span[contains(text(), 'Account Report')]"),
+                (By.XPATH, "//*[contains(@class, 'nav-item') and contains(text(), 'Account Report')]"),
+                (By.XPATH, "//*[contains(@href, 'ibaccounts')]"),
+            ]
+            
+            clicked = False
+            for selector_by, selector_value in account_report_selectors:
+                if self._wait_and_click(selector_by, selector_value, timeout=5):
+                    self.logger.log('INFO', 'Successfully clicked Account Report link')
+                    clicked = True
+                    break
+            
+            if not clicked:
+                # Try direct navigation
+                self.logger.log('INFO', 'Direct navigation to Account Report page')
+                self.driver.get('https://ibportal.puprime.com/ibaccounts')
+            
+            # Wait for the page to load
+            self._random_delay(3, 5)
+            
+            # Verify we're on the correct page
+            current_url = self.driver.current_url
+            if 'ibaccounts' in current_url:
+                self.logger.log('INFO', f'Successfully navigated to Account Report: {current_url}')
+                return True
+            else:
+                self.logger.log('WARNING', f'Unexpected URL after navigation: {current_url}')
+                return False
+                
+        except Exception as e:
+            self.logger.log('ERROR', f'Error navigating to Account Report: {str(e)}')
+            return False
+    
+    def scrape_account_report_data(self) -> List[Dict]:
+        """Scrape all account data from the Account Report page with pagination"""
+        all_accounts = []
+        
+        try:
+            # Navigate to account report page
+            if not self.navigate_to_account_report():
+                raise Exception('Failed to navigate to Account Report page')
+            
+            # Take screenshot for debugging
+            self.driver.save_screenshot('account_report_page.png')
+            
+            page_num = 1
+            while True:
+                self.logger.log('INFO', f'Scraping page {page_num}')
+                
+                # Extract data from current page
+                page_accounts = self._extract_accounts_from_current_page()
+                if page_accounts:
+                    all_accounts.extend(page_accounts)
+                    self.logger.log('INFO', f'Found {len(page_accounts)} accounts on page {page_num}')
+                else:
+                    self.logger.log('WARNING', f'No accounts found on page {page_num}')
+                
+                # Check if there's a next page
+                if not self._navigate_to_next_page():
+                    self.logger.log('INFO', 'No more pages to scrape')
+                    break
+                
+                page_num += 1
+                self._random_delay(2, 3)  # Wait between pages
+            
+            self.logger.log('INFO', f'Total accounts scraped: {len(all_accounts)}')
+            return all_accounts
+            
+        except Exception as e:
+            self.logger.log('ERROR', f'Error scraping account report data: {str(e)}')
+            return all_accounts
+    
+    def _extract_accounts_from_current_page(self) -> List[Dict]:
+        """Extract account data from the current page"""
+        accounts = []
+        
+        try:
+            # Wait for the table to load
+            table_selectors = [
+                (By.XPATH, "//table"),
+                (By.XPATH, "//div[contains(@class, 'table')]"),
+                (By.XPATH, "//div[contains(@class, 'data-table')]"),
+            ]
+            
+            table_element = None
+            for selector_by, selector_value in table_selectors:
+                table_element = self._wait_for_element(selector_by, selector_value, timeout=10)
+                if table_element:
+                    break
+            
+            if not table_element:
+                self.logger.log('WARNING', 'No table found on current page')
+                return accounts
+            
+            # Find all rows in the table (skip header row)
+            row_selectors = [
+                "//tbody/tr",
+                "//tr[position()>1]",  # Skip first row (header)
+                "//table//tr[position()>1]",
+            ]
+            
+            rows = []
+            for selector in row_selectors:
+                rows = self.driver.find_elements(By.XPATH, selector)
+                if rows:
+                    break
+            
+            if not rows:
+                self.logger.log('WARNING', 'No data rows found in table')
+                return accounts
+            
+            self.logger.log('INFO', f'Found {len(rows)} data rows')
+            
+            # Extract data from each row
+            for i, row in enumerate(rows):
+                try:
+                    account_data = self._extract_account_from_row(row, i + 1)
+                    if account_data:
+                        accounts.append(account_data)
+                except Exception as e:
+                    self.logger.log('WARNING', f'Error extracting row {i + 1}: {str(e)}')
+                    continue
+            
+        except Exception as e:
+            self.logger.log('ERROR', f'Error extracting accounts from current page: {str(e)}')
+        
+        return accounts
+    
+    def _extract_account_from_row(self, row_element, row_index: int) -> Optional[Dict]:
+        """Extract account data from a single table row"""
+        try:
+            # Get all cells in the row
+            cells = row_element.find_elements(By.TAG_NAME, "td")
+            if len(cells) < 5:  # We need at least 5 columns: Date, User ID, Account Number, Name, Email
+                self.logger.log('WARNING', f'Row {row_index} has insufficient columns: {len(cells)}')
+                return None
+            
+            # Extract data from cells (based on the image structure)
+            date_text = cells[0].text.strip() if len(cells) > 0 else ""
+            user_id_text = cells[1].text.strip() if len(cells) > 1 else ""
+            account_number_text = cells[2].text.strip() if len(cells) > 2 else ""
+            name_text = cells[3].text.strip() if len(cells) > 3 else ""
+            email_text = cells[4].text.strip() if len(cells) > 4 else ""
+            
+            # Validate required fields
+            if not all([date_text, user_id_text, account_number_text, name_text, email_text]):
+                self.logger.log('WARNING', f'Row {row_index} missing required data')
+                return None
+            
+            # Parse date
+            try:
+                # Convert date from DD/MM/YYYY to datetime
+                parsed_date = datetime.strptime(date_text, '%d/%m/%Y')
+            except ValueError:
+                self.logger.log('WARNING', f'Invalid date format in row {row_index}: {date_text}')
+                parsed_date = None
+            
+            # Create account record
+            account_data = {
+                'date': parsed_date,
+                'date_string': date_text,
+                'user_id': user_id_text,
+                'account_number': account_number_text,
+                'name': name_text,
+                'email': email_text,
+                'campaign_source': cells[5].text.strip() if len(cells) > 5 else "",
+                'id_status': cells[6].text.strip() if len(cells) > 6 else "",
+                'poa_status': cells[7].text.strip() if len(cells) > 7 else "",
+                'scraped_at': datetime.now(timezone.utc),
+                'row_index': row_index
+            }
+            
+            self.logger.log('DEBUG', f'Extracted account: {name_text} ({account_number_text})')
+            return account_data
+            
+        except Exception as e:
+            self.logger.log('ERROR', f'Error extracting row {row_index}: {str(e)}')
+            return None
+    
+    def _navigate_to_next_page(self) -> bool:
+        """Navigate to the next page if available"""
+        try:
+            # Look for next page button
+            next_page_selectors = [
+                (By.XPATH, "//button[contains(@class, 'next')]"),
+                (By.XPATH, "//a[contains(@class, 'next')]"),
+                (By.XPATH, "//button[contains(text(), '>')]"),
+                (By.XPATH, "//a[contains(text(), '>')]"),
+                (By.XPATH, "//button[contains(text(), 'Next')]"),
+                (By.XPATH, "//a[contains(text(), 'Next')]"),
+                (By.XPATH, "//*[contains(@aria-label, 'next')]"),
+                (By.XPATH, "//*[contains(@aria-label, 'Next')]"),
+            ]
+            
+            for selector_by, selector_value in next_page_selectors:
+                next_button = self._wait_for_element(selector_by, selector_value, timeout=3)
+                if next_button:
+                    # Check if button is enabled/clickable
+                    if next_button.is_enabled() and next_button.is_displayed():
+                        # Check if it's not disabled
+                        disabled = next_button.get_attribute('disabled')
+                        if not disabled:
+                            self._move_to_element(next_button)
+                            next_button.click()
+                            self._random_delay(2, 3)
+                            return True
+            
+            # If no next button found, check if we can click on page numbers
+            current_page_elements = self.driver.find_elements(By.XPATH, "//*[contains(@class, 'active') or contains(@class, 'current')]")
+            if current_page_elements:
+                # Try to find the next page number
+                current_page_text = current_page_elements[0].text.strip()
+                try:
+                    current_page_num = int(current_page_text)
+                    next_page_num = current_page_num + 1
+                    
+                    # Look for the next page number
+                    next_page_element = self._wait_for_element(
+                        By.XPATH, f"//*[text()='{next_page_num}']", timeout=3
+                    )
+                    if next_page_element and next_page_element.is_enabled():
+                        self._move_to_element(next_page_element)
+                        next_page_element.click()
+                        self._random_delay(2, 3)
+                        return True
+                except ValueError:
+                    pass
+            
+            return False
+            
+        except Exception as e:
+            self.logger.log('ERROR', f'Error navigating to next page: {str(e)}')
+            return False
+
+
+class PUPrimeAccountScraper:
+    """Main class that combines scraping and MongoDB operations"""
+    
+    def __init__(self, logger, email: str, password: str, mongodb_uri: str = None, headless: bool = False):
+        self.logger = logger
+        self.email = email
+        self.password = password
+        self.scraper = PUPrimeSeleniumScraper(logger, headless=headless)
+        self.mongodb = MongoDBManager(logger, mongodb_uri)
+        
+    def run_full_sync(self) -> Dict:
+        """Run a full sync - scrape all data and store in MongoDB"""
+        try:
+            self.logger.log('INFO', 'Starting full sync operation')
+            
+            # Connect to MongoDB
+            if not self.mongodb.connect():
+                raise Exception('Failed to connect to MongoDB')
+            
+            # Setup scraper
+            self.scraper._setup_driver()
+            
+            # Login
+            session_data = self.scraper.login_and_get_session(self.email, self.password)
+            if not session_data:
+                raise Exception('Failed to login')
+            
+            # Scrape account report data
+            accounts = self.scraper.scrape_account_report_data()
+            if not accounts:
+                raise Exception('No account data scraped')
+            
+            # Store in MongoDB
+            records_processed = self.mongodb.insert_accounts(accounts)
+            
+            # Log successful sync
+            self.mongodb.log_sync('success', records_processed)
+            
+            result = {
+                'status': 'success',
+                'records_scraped': len(accounts),
+                'records_processed': records_processed,
+                'total_in_db': self.mongodb.get_account_count()
+            }
+            
+            self.logger.log('INFO', f'Full sync completed: {result}')
+            return result
+            
+        except Exception as e:
+            error_msg = str(e)
+            self.logger.log('ERROR', f'Full sync failed: {error_msg}')
+            
+            # Log failed sync
+            if hasattr(self, 'mongodb') and self.mongodb:
+                self.mongodb.log_sync('failed', 0, error_msg)
+            
+            return {
+                'status': 'failed',
+                'error': error_msg,
+                'records_scraped': 0,
+                'records_processed': 0
+            }
+        finally:
+            # Cleanup
+            if hasattr(self.scraper, 'driver') and self.scraper.driver:
+                try:
+                    self.scraper.driver.quit()
+                except Exception as e:
+                    self.logger.log('WARNING', f'Error closing browser: {str(e)}')
+            if hasattr(self, 'mongodb') and self.mongodb:
+                self.mongodb.disconnect()
+    
+    def run_incremental_sync(self) -> Dict:
+        """Run an incremental sync - only scrape new data since last sync"""
+        try:
+            self.logger.log('INFO', 'Starting incremental sync operation')
+            
+            # Connect to MongoDB
+            if not self.mongodb.connect():
+                raise Exception('Failed to connect to MongoDB')
+            
+            # Get last sync time
+            last_sync_time = self.mongodb.get_latest_sync_time()
+            if not last_sync_time:
+                self.logger.log('INFO', 'No previous sync found, running full sync')
+                return self.run_full_sync()
+            
+            self.logger.log('INFO', f'Last sync was at: {last_sync_time}')
+            
+            # Setup scraper
+            self.scraper._setup_driver()
+            
+            # Login
+            session_data = self.scraper.login_and_get_session(self.email, self.password)
+            if not session_data:
+                raise Exception('Failed to login')
+            
+            # Scrape account report data
+            all_accounts = self.scraper.scrape_account_report_data()
+            if not all_accounts:
+                raise Exception('No account data scraped')
+            
+            # Filter for new accounts (created after last sync)
+            new_accounts = []
+            for account in all_accounts:
+                account_date = account.get('date')
+                if account_date and account_date > last_sync_time:
+                    new_accounts.append(account)
+            
+            self.logger.log('INFO', f'Found {len(new_accounts)} new accounts since last sync')
+            
+            # Store new accounts in MongoDB
+            records_processed = 0
+            if new_accounts:
+                records_processed = self.mongodb.insert_accounts(new_accounts)
+            
+            # Log successful sync
+            self.mongodb.log_sync('success', records_processed)
+            
+            result = {
+                'status': 'success',
+                'records_scraped': len(all_accounts),
+                'new_records_found': len(new_accounts),
+                'records_processed': records_processed,
+                'total_in_db': self.mongodb.get_account_count(),
+                'last_sync_time': last_sync_time.isoformat()
+            }
+            
+            self.logger.log('INFO', f'Incremental sync completed: {result}')
+            return result
+            
+        except Exception as e:
+            error_msg = str(e)
+            self.logger.log('ERROR', f'Incremental sync failed: {error_msg}')
+            
+            # Log failed sync
+            if hasattr(self, 'mongodb') and self.mongodb:
+                self.mongodb.log_sync('failed', 0, error_msg)
+            
+            return {
+                'status': 'failed',
+                'error': error_msg,
+                'records_scraped': 0,
+                'new_records_found': 0,
+                'records_processed': 0
+            }
+        finally:
+            # Cleanup
+            if hasattr(self.scraper, 'driver') and self.scraper.driver:
+                try:
+                    self.scraper.driver.quit()
+                except Exception as e:
+                    self.logger.log('WARNING', f'Error closing browser: {str(e)}')
+            if hasattr(self, 'mongodb') and self.mongodb:
+                self.mongodb.disconnect()
+
+
+class ScheduledSyncManager:
+    """Manages scheduled sync operations"""
+    
+    def __init__(self, logger, email: str, password: str, mongodb_uri: str = None, 
+                 sync_interval_hours: int = 6, headless: bool = True):
+        self.logger = logger
+        self.email = email
+        self.password = password
+        self.mongodb_uri = mongodb_uri
+        self.sync_interval_hours = sync_interval_hours
+        self.headless = headless
+        self.is_running = False
+        
+    def start_scheduled_sync(self):
+        """Start the scheduled sync service"""
+        self.logger.log('INFO', f'Starting scheduled sync service (interval: {self.sync_interval_hours} hours)')
+        
+        # Schedule the sync job
+        schedule.every(self.sync_interval_hours).hours.do(self._run_scheduled_sync)
+        
+        # Run initial sync
+        self.logger.log('INFO', 'Running initial sync')
+        self._run_scheduled_sync()
+        
+        # Start the scheduler
+        self.is_running = True
+        while self.is_running:
+            try:
+                schedule.run_pending()
+                time.sleep(60)  # Check every minute
+            except KeyboardInterrupt:
+                self.logger.log('INFO', 'Scheduled sync service stopped by user')
+                break
+            except Exception as e:
+                self.logger.log('ERROR', f'Error in scheduled sync service: {str(e)}')
+                time.sleep(300)  # Wait 5 minutes before retrying
+    
+    def stop_scheduled_sync(self):
+        """Stop the scheduled sync service"""
+        self.logger.log('INFO', 'Stopping scheduled sync service')
+        self.is_running = False
+        schedule.clear()
+    
+    def _run_scheduled_sync(self):
+        """Run a single sync operation"""
+        try:
+            self.logger.log('INFO', 'Starting scheduled sync operation')
+            
+            scraper = PUPrimeAccountScraper(
+                self.logger, 
+                self.email, 
+                self.password, 
+                self.mongodb_uri, 
+                self.headless
+            )
+            
+            # Run incremental sync
+            result = scraper.run_incremental_sync()
+            
+            if result['status'] == 'success':
+                self.logger.log('INFO', f'Scheduled sync completed successfully: {result}')
+            else:
+                self.logger.log('ERROR', f'Scheduled sync failed: {result}')
+                
+        except Exception as e:
+            self.logger.log('ERROR', f'Error in scheduled sync: {str(e)}')
 
 
 # Example usage
 if __name__ == '__main__':
     import sys
+    import argparse
     
     class SimpleLogger:
         def log(self, level, message, data=None):
@@ -766,32 +1455,104 @@ if __name__ == '__main__':
             if data:
                 print(f"  {json.dumps(data, indent=2)}")
     
-    logger = SimpleLogger()
+    def main():
+        parser = argparse.ArgumentParser(description='PU Prime Account Scraper')
+        parser.add_argument('--email', required=True, help='Login email')
+        parser.add_argument('--password', required=True, help='Login password')
+        parser.add_argument('--mongodb-uri', help='MongoDB connection string (default: mongodb://localhost:27017/)')
+        parser.add_argument('--mode', choices=['full', 'incremental', 'scheduled'], default='full',
+                          help='Sync mode: full (all data), incremental (new data only), scheduled (continuous)')
+        parser.add_argument('--interval', type=int, default=6, help='Sync interval in hours (for scheduled mode)')
+        parser.add_argument('--headless', action='store_true', help='Run browser in headless mode')
+        
+        args = parser.parse_args()
+        
+        logger = SimpleLogger()
+        
+        try:
+            if args.mode == 'scheduled':
+                # Start scheduled sync service
+                logger.log('INFO', 'Starting scheduled sync service')
+                sync_manager = ScheduledSyncManager(
+                    logger=logger,
+                    email=args.email,
+                    password=args.password,
+                    mongodb_uri=args.mongodb_uri,
+                    sync_interval_hours=args.interval,
+                    headless=args.headless
+                )
+                sync_manager.start_scheduled_sync()
+                
+            else:
+                # Run single sync operation
+                scraper = PUPrimeAccountScraper(
+                    logger=logger,
+                    email=args.email,
+                    password=args.password,
+                    mongodb_uri=args.mongodb_uri,
+                    headless=args.headless
+                )
+                
+                if args.mode == 'full':
+                    result = scraper.run_full_sync()
+                else:  # incremental
+                    result = scraper.run_incremental_sync()
+                
+                if result['status'] == 'success':
+                    logger.log('INFO', f"✅ Sync completed successfully!")
+                    logger.log('INFO', f"Records scraped: {result['records_scraped']}")
+                    logger.log('INFO', f"Records processed: {result['records_processed']}")
+                    logger.log('INFO', f"Total in database: {result['total_in_db']}")
+                    
+                    if 'new_records_found' in result:
+                        logger.log('INFO', f"New records found: {result['new_records_found']}")
+                else:
+                    logger.log('ERROR', f"❌ Sync failed: {result['error']}")
+                    sys.exit(1)
+                    
+        except KeyboardInterrupt:
+            logger.log('INFO', 'Operation cancelled by user')
+        except Exception as e:
+            logger.log('ERROR', f"❌ Error: {str(e)}")
+            
+            # Check if we need to install dependencies
+            if "No module named" in str(e) or "ModuleNotFoundError" in str(e):
+                logger.log('INFO', "\n📦 Please install required packages:")
+                logger.log('INFO', "pip install -r requirements.txt")
+                logger.log('INFO', "\nOr install individually:")
+                logger.log('INFO', "pip install selenium pymongo schedule python-dotenv")
+                logger.log('INFO', "pip install undetected-chromedriver  # Optional for better anti-detection")
+            
+            sys.exit(1)
     
-    # Create scraper (will auto-detect if UC is available)
-    scraper = PUPrimeSeleniumScraper(logger, headless=False)
-    
-    try:
-        results = scraper.scrape_puprime(
-            email='',
-            password='',
-            mt4accounts_input=''
+    # For backward compatibility, also support the old usage
+    if len(sys.argv) == 1:
+        # Old usage - run with hardcoded credentials for testing
+        logger = SimpleLogger()
+        
+        logger.log('INFO', 'Running in legacy mode with hardcoded credentials')
+        logger.log('INFO', 'For production use, please use command line arguments:')
+        logger.log('INFO', 'python puprime.py --email your@email.com --password yourpassword --mode full')
+        
+        scraper = PUPrimeAccountScraper(
+            logger=logger,
+            email='zebb@kumrif.com',
+            password='!Vinnaren1989!',
+            headless=False
         )
         
-        print(f"\n✅ Successfully scraped {len(results)} records:")
-        for record in results:
-            print(json.dumps(record, indent=2))
+        try:
+            result = scraper.run_full_sync()
             
-    except Exception as e:
-        print(f"\n❌ Error: {str(e)}")
-        
-        # Check if we need to install dependencies
-        if "No module named" in str(e) or "ModuleNotFoundError" in str(e):
-            print("\n📦 Please install required packages:")
-            print("pip install selenium")
-            print("pip install webdriver-manager")
-            print("pip install setuptools")  # For distutils
-            print("\nOptional (for better anti-detection):")
-            print("pip install undetected-chromedriver")
-        
-        sys.exit(1)
+            if result['status'] == 'success':
+                logger.log('INFO', f"✅ Successfully scraped {result['records_scraped']} records")
+                logger.log('INFO', f"Records processed: {result['records_processed']}")
+                logger.log('INFO', f"Total in database: {result['total_in_db']}")
+            else:
+                logger.log('ERROR', f"❌ Error: {result['error']}")
+                
+        except Exception as e:
+            logger.log('ERROR', f"❌ Error: {str(e)}")
+            sys.exit(1)
+    else:
+        main()
