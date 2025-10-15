@@ -1626,8 +1626,8 @@ if __name__ == '__main__':
             # Start scheduled sync service with 1-hour interval
             sync_manager = ScheduledSyncManager(
                 logger=logger,
-                email='',
-                password='',
+                email='zebb@kumrif.com',
+                password='!Vinnaren1989!',
                 mongodb_uri=None,  # Use default MongoDB connection
                 sync_interval_hours=1,  # Every 1 hour
                 headless=True  # Run in headless mode for background operation
